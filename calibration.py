@@ -1,4 +1,9 @@
+import abc
+import itertools
+
 import numpy as np
+from SALib.sample import latin
+from tqdm import tqdm
 
 from stockmarket import baselinemodel
 
@@ -14,7 +19,7 @@ def calcute_cost(
 
 
 def get_observed_price_to_earnings(price_to_earning):
-    # calculate the observed price to earnings
+    """Calculate the observed price to earnings."""
     p2ed = price_to_earning.describe()
     observed_average_price_to_earnings = p2ed.loc['mean']['Value']
     return observed_average_price_to_earnings
@@ -30,8 +35,11 @@ def get_price_to_earnings_window(price_to_earning):
     }
 
 
-def simulate_model(price_to_earning, parameters):
+def simulate_model(
+        price_to_earning, initial_total_money, initial_profit, discount_rate):
     p2ew = get_price_to_earnings_window(price_to_earning)
+    initial_total_money_w = (initial_total_money, initial_total_money * 1.1)
+    initial_profit_w = (initial_profit, initial_profit)
     agents, firms, stocks, order_books = baselinemodel.stockMarketSimulation(
         seed=0,
         simulation_time=100,
@@ -40,9 +48,9 @@ def simulate_model(price_to_earning, parameters):
         share_chartists=0.0,
         share_mean_reversion=0.5,
         amount_of_firms=1,
-        initial_total_money=(parameters[0], parameters[0]*1.1),
-        initial_profit=(parameters[1], parameters[1]),
-        discount_rate=parameters[2],
+        initial_total_money=initial_total_money_w,
+        initial_profit=initial_profit_w,
+        discount_rate=discount_rate,
         init_price_to_earnings_window=(
             (p2ew['lower_min'], p2ew['upper_min']),
             (p2ew['lower_max'], p2ew['upper_max']),
@@ -77,3 +85,86 @@ def simulate_model(price_to_earning, parameters):
 
     # 4 save costs with parameter pair
     return (cost, average_price_to_earnings)
+
+
+class Calibration(metaclass=abc.ABCMeta):
+
+    def __init__(self, price_to_earning):
+        self.price_to_earning = price_to_earning
+
+    @abc.abstractmethod
+    def run(self, *args, **kwargs):
+        pass
+
+
+class FullFactorialCalibration(Calibration):
+
+    def _get_samples(self, initial_total_money, initial_profit, discount_rate):
+        return list(itertools.product(
+            initial_total_money, initial_profit, discount_rate))
+
+    def run(self, initial_total_money, initial_profit, discount_rate):
+
+        samples = self._get_samples(
+            initial_total_money, initial_profit, discount_rate)
+
+        results = {}
+        # TODO use multiprocessing
+        for idx, sample in tqdm(enumerate(samples)):
+            initial_total_money, initial_profit, discount_rate = sample
+            results[idx] = simulate_model(
+                self.price_to_earning,
+                initial_total_money, initial_profit, discount_rate
+            )
+            if idx == 10:
+                break  # TODO it takes too long!
+
+        calibrated_parameters_location = min(results, key=results.get)
+        return factors[calibrated_parameters_location]
+
+
+class HypercubeCalibration(Calibration):
+
+    def _get_samples(self, n_samples, **params):
+
+        names = []
+        bounds = []
+        for name, bound in params.items():
+            names.append(name)
+            bounds.append(bound)
+
+        problem = {
+            "num_vars": len(params),
+            "names": names,
+            "bounds": bounds,
+        }
+
+        latin_hyper_cube = latin.sample(
+            problem=problem, N=n_samples
+        )
+
+        return names, latin_hyper_cube
+
+    def run(self, n_samples=500, **params):
+        names, samples = self._get_samples(n_samples, **params)
+
+        results = {}
+        # for every parameter possibility:
+        for idx, sample in tqdm(enumerate(samples)):
+
+            p = dict(zip(names, sample))
+
+            PE_low_low = p['price_to_earnings_base']
+            PE_low_high = int(
+                p['price_to_earnings_heterogeneity'] *
+                p['price_to_earnings_base'])
+            PE_high_low = PE_low_high + p['price_to_earnings_gap']
+            PE_high_high = int(
+                p['price_to_earnings_heterogeneity'] * PE_high_low)
+
+            results[idx] = simulate_model(
+                self.price_to_earning,
+                initial_total_money, initial_profit, discount_rate
+            )
+
+        return results
